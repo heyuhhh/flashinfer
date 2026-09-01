@@ -2541,11 +2541,11 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
             max_seq_len_q=1 if packed_query else None,
         )
         policy = _policy_dict(wrapper)
-        output = _run_case(wrapper, case)
+        output = _run_case(wrapper, case, qo_indptr=qo_indptr)
         _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
         wrappers.append(wrapper)
 
-    assert wrappers[0]._compiled is wrappers[1]._compiled
+    assert wrappers[0]._plan_state.compiled is wrappers[1]._plan_state.compiled
 
 
 @pytest.mark.parametrize(

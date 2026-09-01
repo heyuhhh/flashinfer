@@ -4843,10 +4843,10 @@ def test_attention_ts_decode_q64_kv256_boundaries(
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
-def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
+def test_attention_ts_decode_plans_compiled_topology_for_each_batch_size(
     packed_query: bool,
 ):
-    """One resolved paged-decode topology accepts different batch extents."""
+    """Each batch-specific plan owns a compiled paged-decode topology."""
 
     wrappers = []
     for batch_size in (2, 3):
@@ -4873,12 +4873,16 @@ def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
             qo_indptr=qo_indptr,
             max_seq_len_q=1 if packed_query else None,
         )
-        output = _run_case(wrapper, case)
+        output = _run_case(wrapper, case, qo_indptr=qo_indptr)
         _assert_case_correct(output, case)
         wrappers.append(wrapper)
 
-    assert wrappers[0]._compiled_main is wrappers[1]._compiled_main
-    assert wrappers[0]._compiled_reducer is wrappers[1]._compiled_reducer
+    assert all(wrapper._plan_state.compiled_main is not None for wrapper in wrappers)
+    assert all(
+        (wrapper._plan_state.compiled_reducer is not None)
+        == wrapper._plan_state.config.use_separate_reduction_kernel
+        for wrapper in wrappers
+    )
 
 
 @pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
