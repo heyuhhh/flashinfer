@@ -24,7 +24,7 @@ one sparse row and four warps share a CTA.
 
 ``row_route_offsets`` is a separate plan-owned immutable Int32 tensor.
 ``route_workspace`` contains only mutable row counts and route metadata
-described by ``_BlockSparseRouteLayout``. Payload outside each live row
+described by ``_BlockSparseRouteLayout``. Payload outside each active row
 count is intentionally stale. ``max_blocks_per_row`` is the plan-declared
 semantic BSR-block limit, which remains distinct from packed-route capacity.
 """
@@ -719,7 +719,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
         )
 
         request_begin = cutlass.Int32(0)
-        live_seq_len_kv = cutlass.Int32(self.cfg.seq_len_kv)
+        runtime_seq_len_kv = cutlass.Int32(self.cfg.seq_len_kv)
         selected_block_count = row_end - row_begin
         if cutlass.const_expr(self.route_layout.is_paged):
             raw_seq_len_kv = cutlass.Int32(self.cfg.seq_len_kv)
@@ -728,9 +728,9 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                 runtime_assert(
                     raw_seq_len_kv >= cutlass.Int32(self.minimum_seq_len_kv)
                     and raw_seq_len_kv <= cutlass.Int32(self.cfg.seq_len_kv),
-                    "seq_lens_kv is outside the planned live-length range",
+                    "seq_lens_kv is outside the planned length range",
                 )
-            live_seq_len_kv = _warp_broadcast_i32(raw_seq_len_kv, 0)
+            runtime_seq_len_kv = _warp_broadcast_i32(raw_seq_len_kv, 0)
 
             if (
                 lane_idx == cutlass.Int32(0)
@@ -742,13 +742,13 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                 )
                 runtime_assert(
                     last_block_idx * cutlass.Int32(self.cfg.kv_block_size)
-                    < live_seq_len_kv,
-                    "block_indices row exceeds the live KV block range",
+                    < runtime_seq_len_kv,
+                    "block_indices row exceeds the active KV block range",
                 )
 
             if lane_idx == cutlass.Int32(0) and row_is_valid:
                 required_pages = _positive_i32_ceil_div(
-                    live_seq_len_kv,
+                    runtime_seq_len_kv,
                     self.page_size,
                 )
                 request_begin = cutlass.Int32(paged_kv_indptr[batch_idx])
@@ -766,7 +766,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                         cutlass.Int32(cute.size(paged_kv_indices)),
                         required_pages,
                     ),
-                    "paged_kv_indptr row lacks the required live page capacity",
+                    "paged_kv_indptr row lacks the required active page capacity",
                 )
             request_begin = _warp_broadcast_i32(request_begin, 0)
 
@@ -811,7 +811,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                         self.cfg.kv_block_size,
                         self.cfg.atom_size,
                         self.cfg.logical_origins_per_route,
-                        live_seq_len_kv,
+                        runtime_seq_len_kv,
                     )
                 if cutlass.const_expr(self.route_layout.is_paged):
                     physical_page_id = _resolve_paged_route_atom_page_id(
@@ -840,7 +840,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                     batch_idx,
                     lane_idx,
                     logical_origin_is_valid,
-                    live_seq_len_kv,
+                    runtime_seq_len_kv,
                     self.cfg,
                 )
                 route_idx += cutlass.Int32(1)
