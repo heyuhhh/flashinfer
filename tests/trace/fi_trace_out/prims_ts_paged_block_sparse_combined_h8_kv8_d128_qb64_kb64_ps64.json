@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64",
-  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the combined HND paged KV cache form, and per-run request page tables, K/V lengths, and per-KV-head BSR metadata.",
+  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the combined HND paged KV cache form, and live request page tables, K/V lengths, and per-KV-head BSR metadata.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
@@ -70,7 +70,7 @@
     },
     "num_page_indices": {
       "type": "var",
-      "description": "Capacity of the runtime physical-page ID tensor; the final active page-table offset may be smaller."
+      "description": "Capacity of the runtime physical-page ID tensor; the final live page-table offset may be smaller."
     },
     "kv_planes": {
       "type": "const",
@@ -169,14 +169,14 @@
         "num_page_offsets"
       ],
       "dtype": "int32",
-      "description": "Per-run request offsets into paged_kv_indices."
+      "description": "Live request offsets into paged_kv_indices, read for this call."
     },
     "paged_kv_indices": {
       "shape": [
         "num_page_indices"
       ],
       "dtype": "int32",
-      "description": "Runtime physical-page ID capacity; only the prefix ending at paged_kv_indptr[-1] is active."
+      "description": "Runtime physical-page ID capacity; only the prefix ending at paged_kv_indptr[-1] is live."
     },
     "max_seq_len_kv": {
       "shape": null,
@@ -188,7 +188,7 @@
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Per-run logical K/V lengths read for this call."
+      "description": "Live per-request logical K/V lengths read for this call."
     }
   },
   "outputs": {

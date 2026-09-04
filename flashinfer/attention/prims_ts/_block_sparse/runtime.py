@@ -45,7 +45,7 @@ class _ContiguousKVStorage:
 
 @dataclass(frozen=True)
 class _PagedKVStorage:
-    """Paged K/V storage and request metadata consumed by one run."""
+    """Paged K/V storage and request metadata consumed by one live run."""
 
     paged_kv_cache: PagedKVCache
     block_tables: torch.Tensor
@@ -54,7 +54,7 @@ class _PagedKVStorage:
 
 @dataclass(frozen=True)
 class _PagedKVLaunchPayload:
-    """Launch-only paged metadata derived during shared validation."""
+    """Launch-only live paged metadata derived during shared validation."""
 
     block_tables: torch.Tensor
     block_table_row_stride: int
@@ -75,7 +75,7 @@ class _BlockSparseRunArgs:
     block_indptr: torch.Tensor | None
     block_indices: torch.Tensor | None
     kv_valid_bits: torch.Tensor
-    kv_valid_bits_is_active: bool
+    kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
     exact_block_bits: torch.Tensor | None = None
@@ -205,7 +205,7 @@ def validate_paged_kv_metadata(
     device: torch.device,
     batch_size: int,
 ) -> None:
-    """Validate the shared structural ABI for per-run paged request metadata."""
+    """Validate the shared structural ABI for live paged request metadata."""
 
     for tensor, name, shape in (
         (paged_kv_indptr, "paged_kv_indptr", (batch_size + 1,)),
@@ -394,11 +394,11 @@ def validate_block_sparse_run(
         )
         if metadata_device != state.device:
             raise ValueError(
-                f"per-run metadata must be on {state.device}, got {metadata_device}"
+                f"live metadata must be on {state.device}, got {metadata_device}"
             )
         if metadata_batch_size != state.batch_size:
             raise ValueError(
-                "per-run metadata batch size must match the plan "
+                "live metadata batch size must match the plan "
                 f"({state.batch_size}), got {metadata_batch_size}"
             )
         if table_capacity * page_size < state.seq_len_kv:
@@ -467,7 +467,7 @@ def validate_block_sparse_run(
         k_summary=k_summary,
         v_summary=v_summary,
         kv_valid_bits=effective_kv_valid_bits,
-        kv_valid_bits_is_active=state.use_kv_valid_bits,
+        kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
         paged_kv=paged_kv,
     )
@@ -493,7 +493,7 @@ def record_block_sparse_run_args(
     else:
         assert run_args.exact_block_bits is not None
         run_args.exact_block_bits.record_stream(stream)
-    if run_args.kv_valid_bits_is_active:
+    if run_args.kv_valid_bits_is_live:
         run_args.kv_valid_bits.record_stream(stream)
     if run_args.paged_kv is not None:
         run_args.paged_kv.block_tables.record_stream(stream)

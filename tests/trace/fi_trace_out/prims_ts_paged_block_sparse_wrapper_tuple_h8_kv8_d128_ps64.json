@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64",
-  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and per-run page tables, K/V lengths, and per-KV-head BSR metadata. Static K/V capacity, block geometry, and mask type are retained by plan() and represented as optional trace context.",
+  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and live page tables, K/V lengths, and per-KV-head BSR metadata. Static K/V capacity, block geometry, and mask type are retained by plan() and represented as optional trace context.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.BlockSparsePagedTSWrapper.run",
@@ -165,7 +165,7 @@
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Per-run logical K/V lengths read for this call."
+      "description": "Live per-request logical K/V lengths read for this call."
     },
     "block_tables": {
       "shape": [

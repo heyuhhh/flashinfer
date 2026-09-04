@@ -1359,7 +1359,7 @@ def _validate_mla_output_aliasing(
     qo_indptr: Optional[torch.Tensor],
     workspace_buffer: torch.Tensor,
 ) -> None:
-    """Keep output disjoint from every MLA decode input allocation."""
+    """Keep output disjoint from every live MLA decode allocation."""
 
     _validate_out_does_not_overlap_inputs(
         runtime.out,
@@ -1489,7 +1489,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
         Dense physical-page table for each request. Rows must be inner
         contiguous and non-overlapping, but may have padding between them.
     seq_lens : torch.Tensor
-        Per-run K/V sequence lengths.
+        Live K/V sequence lengths.
     max_seq_len : int
         Static maximum K/V length used for policy selection and JIT caching.
     qo_indptr : torch.Tensor, optional

@@ -24,7 +24,7 @@ synchronous canonical-BSR inspection to derive its temporary plan capacity.
 ``BlockSparsePagedTSWrapper`` shares the same scheduling policy and decode
 kernel, but plans only fixed Q geometry and maximum K/V capacity. Page spans,
 physical page IDs, sequence lengths, sparse routes, and token bits are all
-per-run inputs. Reusable runs validate their tensor ABI but trust their values,
+live run inputs. Reusable runs validate their tensor ABI but trust their values,
 while the paged one-shot API synchronously validates both before creating its
 temporary plan.
 """
@@ -527,7 +527,7 @@ def block_sparse_attention(
 
 
 class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
-    """Plan fixed capacity and run with per-run request metadata."""
+    """Plan fixed capacity and run with entirely live request metadata."""
 
     @_serialize_plan
     def plan(
@@ -552,10 +552,10 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
     ) -> None:
         """Plan fixed-Q geometry and a maximum variable-K capacity.
 
-        The plan stores no request metadata. Every run supplies per-run page-table
-        offsets, page IDs, sequence lengths, sparse routes, and optional token
+        The plan stores no request metadata. Every run supplies live page tables,
+        sequence lengths, sparse routes, and optional token
         bits. ``max_seq_len_kv`` fixes compilation and mask capacity. Attention
-        consumes caller-owned lengths directly, without a plan-owned copy
+        consumes caller-owned live lengths directly, without a plan-owned copy
         or device-to-host validation.
 
         ``q_block_size`` may be any positive signed-Int32 value satisfying
@@ -612,7 +612,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Launch with per-run lengths, page tables, and sparse routes.
+        """Launch with live lengths, page tables, and sparse routes.
 
         Q and O are compact ``[B, Sq, Hq, D]`` tensors, including ``Sq=1``.
         The cache is either combined ``[P, 2, Hkv, page, D]`` or a ``(K, V)``
@@ -625,10 +625,10 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         are read on device. The caller must keep every dense length in
         ``[1, max_seq_len_kv]`` and every causal length in
         ``[Sq, max_seq_len_kv]``. Every page-table row must contain at least
-        ``ceil(seq_lens_kv[b] / page_size)`` active entries. Every page ID in its active
+        ``ceil(seq_lens_kv[b] / page_size)`` live entries. Every page ID in its live
         prefix must lie in ``[0, P)``. Each BSR row must contain strictly
         increasing, unique block IDs whose final block starts before that
-        request's K/V length, and its width must not exceed the planned
+        request's live K/V length, and its width must not exceed the planned
         ``max_blocks_per_row``. Reusable runs trust all of these device-side
         values; assertion-enabled CuTe DSL builds diagnose violations
         encountered while preparing selected routes, while default builds
@@ -654,11 +654,11 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             ``(K, V)`` tuple whose tensors are
             ``[P, Hkv, page_size, D]``.
         block_tables : torch.Tensor
-            Per-run Int32 physical page IDs with shape ``[B, C]``. Entries are
+            Live Int32 physical page IDs with shape ``[B, C]``. Entries are
             contiguous within each row; padded, non-overlapping row strides are
             supported and inactive tail entries are ignored.
         seq_lens_kv : torch.Tensor
-            Contiguous Int32 per-run logical K/V lengths with shape ``[B]``.
+            Contiguous Int32 live logical K/V lengths with shape ``[B]``.
             Values must satisfy the dense or causal bounds above.
         block_indptr : torch.Tensor
             Contiguous Int32 BSR row offsets with shape
@@ -721,10 +721,10 @@ def block_sparse_attention_with_paged_kv_cache(
 ) -> torch.Tensor:
     """Plan and run one fixed-Q paged block-sparse attention launch.
 
-    This convenience entry point synchronously validates per-run page and sparse
-    metadata, including the complete active physical-page-ID prefix, creates a
+    This convenience entry point synchronously validates live page and sparse
+    metadata, including the complete live physical-page-ID prefix, creates a
     capacity-only temporary plan, then forwards the inspected tensors through
-    the trusted per-run API. It cannot run during CUDA Graph capture; plan a
+    the trusted live run API. It cannot run during CUDA Graph capture; plan a
     wrapper outside capture and capture only
     :meth:`BlockSparsePagedTSWrapper.run` instead.
 
