@@ -827,10 +827,31 @@ def _make_prims_ts_paged_block_sparse_wrapper_trace(*, combined: bool) -> TraceT
     cache_form = "combined" if combined else "tuple"
     axes = dict(one_shot.axes)
     del axes["q_block_size"], axes["kv_block_size"]
+    del axes["num_page_offsets"], axes["num_page_indices"]
+    axes["max_pages_per_seq"] = Var(
+        description="Runtime fixed page-table column capacity."
+    )
     inputs = _make_block_sparse_wrapper_inputs(
         one_shot,
         ("q_block_size", "kv_block_size", "max_seq_len_kv", "mask_type"),
     )
+    del inputs["paged_kv_indptr"], inputs["paged_kv_indices"]
+    inputs["block_tables"] = Tensor(
+        ["batch_size", "max_pages_per_seq"],
+        dtype="int32",
+        description=(
+            "Per-run physical page IDs in a fixed 2D table; rows may use a "
+            "padded non-overlapping stride and inactive tail entries are ignored."
+        ),
+    )
+    constraints = [
+        constraint
+        for constraint in one_shot.constraints
+        if "paged_kv_indptr" not in constraint
+        and "num_page_offsets" not in constraint
+        and "num_page_indices" not in constraint
+    ]
+    constraints.append("max_pages_per_seq * page_size >= max_seq_len_kv")
     return TraceTemplate(
         op_type=one_shot.op_type,
         name_prefix=f"prims_ts_paged_block_sparse_wrapper_{cache_form}",
@@ -844,7 +865,7 @@ def _make_prims_ts_paged_block_sparse_wrapper_trace(*, combined: bool) -> TraceT
         axes=axes,
         inputs=inputs,
         outputs=dict(one_shot.outputs),
-        constraints=list(one_shot.constraints),
+        constraints=constraints,
         tags=list(one_shot.tags),
     )
 

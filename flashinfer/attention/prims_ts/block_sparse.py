@@ -75,6 +75,7 @@ from ._block_sparse.runtime import (
 )
 from .decode import (
     PagedKVCache,
+    _csr_to_block_tables,
     _normalize_paged_kv_cache,
     _resolve_cuda_device,
 )
@@ -602,8 +603,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         self,
         q: torch.Tensor,
         paged_kv_cache: PagedKVCache,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
+        block_tables: torch.Tensor,
         seq_lens_kv: torch.Tensor,
         block_indptr: torch.Tensor,
         block_indices: torch.Tensor,
@@ -619,14 +619,13 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         tuple whose members are ``[P, Hkv, page, D]`` with compact inner HND
         strides and arbitrary non-overlapping outer page strides.
 
-        ``paged_kv_indptr`` is compact Int32 ``[B + 1]``;
-        ``paged_kv_indices`` is compact Int32 with capacity at least its active
-        final offset; and ``seq_lens_kv`` is compact Int32 ``[B]``. All values
+        ``block_tables`` is Int32 ``[B, C]``, contiguous within each row but
+        permitted to use a padded outer row stride; ``seq_lens_kv`` is compact
+        Int32 ``[B]``. All values
         are read on device. The caller must keep every dense length in
         ``[1, max_seq_len_kv]`` and every causal length in
-        ``[Sq, max_seq_len_kv]``. ``paged_kv_indptr`` must start at zero and
-        contain bounded, monotone rows with at least
-        ``ceil(seq_lens_kv[b] / page_size)`` entries. Every page ID in its active
+        ``[Sq, max_seq_len_kv]``. Every page-table row must contain at least
+        ``ceil(seq_lens_kv[b] / page_size)`` active entries. Every page ID in its active
         prefix must lie in ``[0, P)``. Each BSR row must contain strictly
         increasing, unique block IDs whose final block starts before that
         request's K/V length, and its width must not exceed the planned
@@ -654,10 +653,10 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             Either a combined cache ``[P, 2, Hkv, page_size, D]`` or a
             ``(K, V)`` tuple whose tensors are
             ``[P, Hkv, page_size, D]``.
-        paged_kv_indptr : torch.Tensor
-            Contiguous Int32 per-run request offsets with shape ``[B + 1]``.
-        paged_kv_indices : torch.Tensor
-            Contiguous Int32 physical-page ID capacity.
+        block_tables : torch.Tensor
+            Per-run Int32 physical page IDs with shape ``[B, C]``. Entries are
+            contiguous within each row; padded, non-overlapping row strides are
+            supported and inactive tail entries are ignored.
         seq_lens_kv : torch.Tensor
             Contiguous Int32 per-run logical K/V lengths with shape ``[B]``.
             Values must satisfy the dense or causal bounds above.
@@ -689,8 +688,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             q,
             _PagedKVStorage(
                 paged_kv_cache=paged_kv_cache,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
+                block_tables=block_tables,
                 seq_lens_kv=seq_lens_kv,
             ),
             state=state,
@@ -849,6 +847,20 @@ def block_sparse_attention_with_paged_kv_cache(
         num_physical_kv_pages=num_physical_kv_pages,
         stream=torch.cuda.current_stream(metadata_device),
     )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "block_sparse_attention_with_paged_kv_cache cannot convert CSR "
+            "metadata during CUDA Graph capture; use BlockSparsePagedTSWrapper "
+            "with block_tables"
+        )
+    indptr_host = tuple(int(value) for value in paged_kv_indptr.tolist())
+    seq_lens_host = tuple(int(value) for value in seq_lens_kv.tolist())
+    block_tables = _csr_to_block_tables(
+        paged_kv_indices[: indptr_host[-1]],
+        indptr_host,
+        seq_lens_host,
+        page_size=page_size,
+    )
 
     wrapper = BlockSparsePagedTSWrapper()
     assert static.page_size is not None
@@ -873,8 +885,7 @@ def block_sparse_attention_with_paged_kv_cache(
     return wrapper.run(
         q,
         paged_kv_cache,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         seq_lens_kv,
         block_indptr,
         block_indices,

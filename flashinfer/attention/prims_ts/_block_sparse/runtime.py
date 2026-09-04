@@ -25,6 +25,7 @@ from ..decode import (
     PagedKVCache,
     _normalize_paged_kv_cache,
     _validate_16byte_alignment,
+    _validate_block_table_metadata,
     _validate_exact_compact_strides,
     _validate_scale,
 )
@@ -47,8 +48,7 @@ class _PagedKVStorage:
     """Paged K/V storage and request metadata consumed by one run."""
 
     paged_kv_cache: PagedKVCache
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
+    block_tables: torch.Tensor
     seq_lens_kv: torch.Tensor
 
 
@@ -56,8 +56,8 @@ class _PagedKVStorage:
 class _PagedKVLaunchPayload:
     """Launch-only paged metadata derived during shared validation."""
 
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
+    block_tables: torch.Tensor
+    block_table_row_stride: int
     seq_lens_kv: torch.Tensor
     num_physical_kv_pages: int
     k_page_stride: int
@@ -386,16 +386,30 @@ def validate_block_sparse_run(
             raise ValueError(
                 f"K/V dtype must match the plan ({state.kv_dtype}), got {k.dtype}"
             )
-        validate_paged_kv_metadata(
-            kv_storage.paged_kv_indptr,
-            kv_storage.paged_kv_indices,
-            kv_storage.seq_lens_kv,
-            device=state.device,
-            batch_size=state.batch_size,
+        metadata_device, metadata_batch_size, table_capacity = (
+            _validate_block_table_metadata(
+                kv_storage.block_tables,
+                kv_storage.seq_lens_kv,
+            )
         )
+        if metadata_device != state.device:
+            raise ValueError(
+                f"per-run metadata must be on {state.device}, got {metadata_device}"
+            )
+        if metadata_batch_size != state.batch_size:
+            raise ValueError(
+                "per-run metadata batch size must match the plan "
+                f"({state.batch_size}), got {metadata_batch_size}"
+            )
+        if table_capacity * page_size < state.seq_len_kv:
+            raise ValueError(
+                "block_tables must cover the planned K/V capacity: expected at "
+                f"least {(state.seq_len_kv + page_size - 1) // page_size} columns, "
+                f"got {table_capacity}"
+            )
         paged_kv = _PagedKVLaunchPayload(
-            paged_kv_indptr=kv_storage.paged_kv_indptr,
-            paged_kv_indices=kv_storage.paged_kv_indices,
+            block_tables=kv_storage.block_tables,
+            block_table_row_stride=kv_storage.block_tables.stride(0),
             seq_lens_kv=kv_storage.seq_lens_kv,
             num_physical_kv_pages=num_physical_kv_pages,
             k_page_stride=k_page_stride,
@@ -405,8 +419,7 @@ def validate_block_sparse_run(
             ("q", q),
             ("k_cache", k),
             ("v_cache", v),
-            ("paged_kv_indptr", kv_storage.paged_kv_indptr),
-            ("paged_kv_indices", kv_storage.paged_kv_indices),
+            ("block_tables", kv_storage.block_tables),
             ("seq_lens_kv", kv_storage.seq_lens_kv),
         ]
     else:
@@ -483,8 +496,7 @@ def record_block_sparse_run_args(
     if run_args.kv_valid_bits_is_active:
         run_args.kv_valid_bits.record_stream(stream)
     if run_args.paged_kv is not None:
-        run_args.paged_kv.paged_kv_indptr.record_stream(stream)
-        run_args.paged_kv.paged_kv_indices.record_stream(stream)
+        run_args.paged_kv.block_tables.record_stream(stream)
         run_args.paged_kv.seq_lens_kv.record_stream(stream)
 
 
@@ -508,13 +520,13 @@ def launch_block_sparse(
             run_args.block_indptr,
             run_args.block_indices,
             run_args.kv_valid_bits,
-            run_args.paged_kv.paged_kv_indptr,
-            run_args.paged_kv.paged_kv_indices,
+            run_args.paged_kv.block_tables,
             run_args.paged_kv.seq_lens_kv,
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,
             run_args.paged_kv.num_physical_kv_pages,
+            run_args.paged_kv.block_table_row_stride,
             run_args.paged_kv.k_page_stride,
             run_args.paged_kv.v_page_stride,
             run_args.sm_scale,

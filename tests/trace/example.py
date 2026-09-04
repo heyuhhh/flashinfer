@@ -700,6 +700,11 @@ bs_paged_kv_indices = torch.cat(
         torch.zeros(1, dtype=torch.int32, device=device),
     )
 )
+bs_block_table_storage = torch.full(
+    (bs_B, bs_pages_per_request + 1), -1, dtype=torch.int32, device=device
+)
+bs_block_tables = bs_block_table_storage[:, :bs_pages_per_request]
+bs_block_tables.copy_(bs_paged_kv_indices[:bs_num_pages].view(bs_B, -1))
 bs_seq_lens_kv = torch.full((bs_B,), bs_Skv, dtype=torch.int32, device=device)
 # Exercise a live length that does not fill its last page.
 bs_seq_lens_kv[0] = bs_Skv - bs_page_size // 2
@@ -778,8 +783,7 @@ with contextlib.suppress(Exception):
         bs_paged_wrapper.run(
             bs_q,
             bs_paged_cache,
-            bs_paged_kv_indptr,
-            bs_paged_kv_indices,
+            bs_block_tables,
             bs_seq_lens_kv,
             bs_block_indptr,
             bs_block_indices,
