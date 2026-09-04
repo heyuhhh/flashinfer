@@ -3160,7 +3160,11 @@ def test_attention_ts_decode_block_table_structure_accepts_padded_rows() -> None
 
     assert block_tables.shape == (2, 2)
     assert block_tables.stride() == (4, 1)
-    assert _validate_block_table_metadata(block_tables, seq_lens) == (device, 2, 2)
+    assert _validate_block_table_metadata(block_tables, seq_lens) == (
+        seq_lens.device,
+        2,
+        2,
+    )
 
     noncompact_rows = backing[:, ::2]
     with pytest.raises(ValueError, match="contiguous within each row"):
@@ -3186,6 +3190,18 @@ def test_attention_ts_decode_csr_conversion_uses_actual_padded_row_starts() -> N
 
     assert block_tables.tolist() == [[10, -1], [20, 21]]
     assert block_tables.data_ptr() != page_ids.data_ptr()
+
+    planned_capacity = _csr_to_block_tables(
+        page_ids,
+        (0, 3, 6),
+        (1, 33),
+        page_size=32,
+        min_table_capacity=4,
+    )
+    assert planned_capacity.tolist() == [
+        [10, -1, -1, -1],
+        [20, 21, -1, -1],
+    ]
 
     uniform = _csr_to_block_tables(
         page_ids,

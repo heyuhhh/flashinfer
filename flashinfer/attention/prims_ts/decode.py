@@ -1094,14 +1094,16 @@ def _csr_to_block_tables(
     seq_lens: tuple[int, ...],
     *,
     page_size: int,
+    min_table_capacity: int = 0,
 ) -> torch.Tensor:
     """Materialize canonical CSR page IDs as a native fixed page table.
 
     The canonical one-shot API has already synchronized to validate CSR values.
     Equal-width rows are exposed as a zero-copy view only when their actual CSR
     extents equal the native table capacity. Otherwise a temporary dense table
-    copies each active prefix from its true CSR row start. Its inactive tail is
-    deliberately invalid; the native kernel must bound every access by
+    copies each active prefix from its true CSR row start. ``min_table_capacity``
+    may reserve additional plan-owned columns. Every inactive tail entry is
+    deliberately ``-1``; the native kernel must bound every access by
     ``seq_lens``.
     """
 
@@ -1121,7 +1123,9 @@ def _csr_to_block_tables(
         raise ValueError("CSR indptr offsets must be nondecreasing")
     if indptr[-1] != int(paged_kv_indices.numel()):
         raise ValueError("the final CSR indptr offset must equal the page-ID count")
-    table_capacity = max(page_counts)
+    if min_table_capacity < 0:
+        raise ValueError("min_table_capacity must be nonnegative")
+    table_capacity = max(max(page_counts), min_table_capacity)
     csr_page_counts = tuple(
         end - begin for begin, end in zip(indptr[:-1], indptr[1:], strict=True)
     )

@@ -4748,7 +4748,28 @@ def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @torch.no_grad()
-def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
+@pytest.mark.parametrize(
+    ("runtime_seq_len_kv", "physical_page_ids", "patterns"),
+    (
+        pytest.param(
+            96,
+            (0, 2),
+            ((((0,),), ((1,),)),),
+            id="runtime96-two-pages",
+        ),
+        pytest.param(
+            64,
+            (0,),
+            ((((0,),), ((0,),)),),
+            id="runtime64-plan128-padded",
+        ),
+    ),
+)
+def test_public_paged_one_shot_q64_kv256_gqa_matches_reference(
+    runtime_seq_len_kv: int,
+    physical_page_ids: tuple[int, ...],
+    patterns: _Patterns,
+) -> None:
     torch.manual_seed(20260818)
     case = _Case(
         "paged_one_shot_q64_kv256_gqa",
@@ -4767,17 +4788,11 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
         expected_kv_tile=256,
     )
     page_size = 64
-    runtime_seq_len_kv = 96
-    paged_kv_indptr = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
-    paged_kv_indices = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
-    block_indptr, block_indices = _make_bsr(
-        (
-            (
-                ((0,),),
-                ((1,),),
-            ),
-        )
+    paged_kv_indptr = torch.tensor(
+        [0, len(physical_page_ids)], device="cuda", dtype=torch.int32
     )
+    paged_kv_indices = torch.tensor(physical_page_ids, device="cuda", dtype=torch.int32)
+    block_indptr, block_indices = _make_bsr(patterns)
     q = (
         torch.randn(
             (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
@@ -4812,16 +4827,11 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
     ).unsqueeze(0)
     sm_scale = _HEAD_DIM**-0.5
     expected = _reference(
-        case,
+        replace(case, seq_len_kv=len(physical_page_ids) * page_size),
         q,
         logical_k,
         logical_v,
-        (
-            (
-                ((0,),),
-                ((1,),),
-            ),
-        ),
+        patterns,
         (frozenset(range(runtime_seq_len_kv)),),
         sm_scale,
     )

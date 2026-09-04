@@ -860,6 +860,7 @@ def block_sparse_attention_with_paged_kv_cache(
         indptr_host,
         seq_lens_host,
         page_size=page_size,
+        min_table_capacity=(max_seq_len_kv + page_size - 1) // page_size,
     )
 
     wrapper = BlockSparsePagedTSWrapper()

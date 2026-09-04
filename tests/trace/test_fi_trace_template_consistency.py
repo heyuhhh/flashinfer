@@ -41,6 +41,8 @@ generic checks are insufficient.  See the docstring in
 import ast
 from collections import Counter
 import inspect
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -776,6 +778,34 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
             assert template.inputs[name].optional
     for template in wrapper_paged_templates.values():
         assert template.inputs["max_seq_len_kv"].optional
+        assert template.tags == [
+            "backend:prims-ts",
+            "sparse:block",
+            "sparse-format:bsr",
+            "routes:exact",
+            "status:experimental",
+            "kv-cache:paged",
+        ]
+
+    trace_dir = Path(__file__).parent / "fi_trace_out"
+    fi_api_tag = (
+        "fi_api:flashinfer.attention.prims_ts.block_sparse."
+        "block_sparse_attention_with_paged_kv_cache"
+    )
+    for cache_form, template in (
+        ("tuple", tuple_trace),
+        ("combined", combined_trace),
+    ):
+        golden = json.loads(
+            (
+                trace_dir
+                / (
+                    "prims_ts_paged_block_sparse_"
+                    f"{cache_form}_h8_kv8_d128_qb64_kb64_ps64.json"
+                )
+            ).read_text()
+        )
+        assert golden["tags"] == [fi_api_tag, *template.tags]
 
 
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
