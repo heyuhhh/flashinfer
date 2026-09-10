@@ -657,7 +657,7 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
     assert runtime_q.shape == (2, 3, 2, 128)
     assert runtime_kv_cache.shape == (2, 2, 1, 16, 128)
     assert runtime_kv_cache.is_contiguous()
-    assert runtime_seq_lens.tolist() == [16, 16]
+    assert runtime_seq_lens is None
     assert runtime_block_tables.tolist() == [[0], [1]]
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(128))
     assert run_kwargs["bmm2_scale"] == 1.0

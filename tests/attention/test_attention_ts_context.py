@@ -33,7 +33,7 @@ pytest.importorskip(
     reason="PrimTS attention tests require nvidia-cutlass-dsl==4.7.0",
 )
 
-from cutlass import BFloat16, Float16, Float8E4M3FN
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 
 import flashinfer.attention.prims_ts.context as context_module
@@ -540,6 +540,7 @@ def _plan_paged_wrapper(
     row_stride_multiplier: int = 1,
     uniform_packed_lengths: bool = False,
     has_q_offset: bool = True,
+    paged_v_tail_is_zero: bool = False,
 ) -> _NativePagedMetadata:
     """Compile a conservative paged plan and return its per-run metadata."""
 
@@ -569,6 +570,7 @@ def _plan_paged_wrapper(
         output_scale=reference.output_scale,
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
+        paged_v_tail_is_zero=paged_v_tail_is_zero,
     )
     return metadata
 
@@ -865,6 +867,10 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
         "use_cluster_smem_reduction",
         "use_tensor_cores",
     }
+    allowed_exact_names = {
+        # This is caller-owned variable-window metadata, not a tuning control.
+        "variable_window_cta_starts",
+    }
     violations = []
     for surface in surfaces:
         for parameter in inspect.signature(surface).parameters.values():
@@ -882,7 +888,7 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
                 for token in tokens
                 for prefix in forbidden_token_prefixes
             )
-            if (
+            if parameter.name not in allowed_exact_names and (
                 parameter.name in forbidden_exact_names
                 or has_forbidden_token
                 or has_forbidden_sequence
@@ -924,6 +930,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "output_scale",
         "uniform_packed_lengths",
         "has_q_offset",
+        "paged_v_tail_is_zero",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -947,10 +954,40 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert run_parameters["validate"].default is True
     assert plan_parameters["uniform_packed_lengths"].default is False
     assert plan_parameters["has_q_offset"].default is True
+    assert plan_parameters["paged_v_tail_is_zero"].default is False
     assert not hasattr(BatchPrefillPagedTSWrapper, "plan_live")
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
     assert context_module._PagedContextPlanState.__dataclass_params__.frozen is True
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    (
+        pytest.param(0, id="int-zero"),
+        pytest.param(1, id="int-one"),
+        pytest.param(None, id="none"),
+        pytest.param("true", id="string"),
+    ),
+)
+def test_attention_ts_context_paged_plan_rejects_non_bool_zero_tail_contract(
+    invalid_value,
+) -> None:
+    wrapper = BatchPrefillPagedTSWrapper()
+
+    with pytest.raises(TypeError, match="paged_v_tail_is_zero must be a bool"):
+        wrapper.plan(
+            device="cuda:0",
+            batch_size=1,
+            max_seq_len_q=64,
+            max_kv_len=64,
+            num_qo_heads=4,
+            num_kv_heads=2,
+            head_dim=128,
+            q_dtype=torch.float16,
+            kv_dtype=torch.float16,
+            paged_v_tail_is_zero=invalid_value,
+        )
 
 
 def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contract():
@@ -989,6 +1026,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "kv_indptr",
         "variable_window_token_starts",
         "variable_window_token_ends",
+        "variable_window_cta_starts",
         "out",
         "scale_softmax_log2",
         "output_scale",
@@ -996,6 +1034,10 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     )
     assert run_parameters["qo_indptr"].default is None
     assert run_parameters["kv_indptr"].default is None
+    assert run_parameters["variable_window_cta_starts"].kind is (
+        inspect.Parameter.KEYWORD_ONLY
+    )
+    assert run_parameters["variable_window_cta_starts"].default is None
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
     assert context_module._ContextPlanState.__dataclass_params__.frozen is True
@@ -1098,6 +1140,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         output_dtype=torch.float16,
         uniform_packed_lengths=False,
         has_q_offset=False,
+        paged_v_tail_is_zero=False,
     )
 
     def resolve(*args, **kwargs):
@@ -1138,6 +1181,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert calls["plan"]["max_kv_len"] == 65
     assert calls["plan"]["uniform_packed_lengths"] is False
     assert calls["plan"]["has_q_offset"] is False
+    assert calls["plan"]["paged_v_tail_is_zero"] is False
     assert "max_num_pages_per_seq_kv" not in calls["plan"]
     run_args, run_kwargs = calls["run"]
     assert run_args[3] is qo_indptr
@@ -1401,6 +1445,212 @@ def test_attention_ts_context_variable_window_bounds_are_runtime_state(
     assert not hasattr(state, "variable_window_token_ends")
 
 
+@pytest.mark.parametrize("validate", (True, False), ids=("validated", "trusted"))
+def test_attention_ts_context_accepts_precomputed_variable_window_cta_starts(
+    monkeypatch,
+    validate: bool,
+) -> None:
+    launch_calls = []
+
+    def compiled(*args):
+        launch_calls.append(args)
+
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_context_scheduler",
+        lambda _geometry: "static_persistent",
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_get_compiled_context",
+        lambda *_key: (compiled, ()),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_validate_runtime_inputs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
+    monkeypatch.setattr(
+        context_module,
+        "_refresh_variable_window_cta_starts",
+        lambda *_args, **_kwargs: pytest.fail(
+            "caller-provided CTA starts must bypass plan scratch"
+        ),
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device="cuda:0",
+        batch_size=2,
+        max_seq_len_q=3,
+        max_kv_len=4,
+        num_qo_heads=2,
+        num_kv_heads=1,
+        head_dim=128,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        mask_type="variable_window",
+    )
+    state = wrapper._plan_state
+    assert state is not None
+    state.variable_window_cta_starts.fill_(123)
+    assert state.variable_window_padded_starts is not None
+    state.variable_window_padded_starts.fill_(456)
+    q = torch.empty((2, 3, 2, 128), dtype=torch.float16)
+    k = torch.empty((2, 4, 1, 128), dtype=torch.float16)
+    v = torch.empty_like(k)
+    starts = torch.tensor(((0, 1, 1), (0, 0, 2)), dtype=torch.int32)
+    ends = torch.tensor(((1, 2, 3), (0, 2, 3)), dtype=torch.int32)
+    cta_starts = torch.tensor(((0,), (0,)), dtype=torch.int32)
+
+    wrapper.run(
+        q,
+        k,
+        v,
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+        variable_window_cta_starts=cta_starts,
+        validate=validate,
+    )
+
+    assert len(launch_calls) == 1
+    assert launch_calls[0][10].data_ptr() == cta_starts.data_ptr()
+    assert launch_calls[0][10].shape == (2,)
+    assert state.variable_window_cta_starts.tolist() == [123, 123]
+    assert torch.all(state.variable_window_padded_starts == 456)
+
+
+def test_attention_ts_context_validates_precomputed_variable_window_cta_starts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
+    geometry = SimpleNamespace(
+        device=torch.device("cpu"),
+        batch_size=2,
+        max_seq_len_q=257,
+        head_dim=128,
+    )
+    token_start_values = tuple(range(257)) + tuple(range(256, -1, -1))
+    cta_starts = torch.tensor(((0, 256), (1, 0)), dtype=torch.int32)
+
+    validated = context_module._validate_variable_window_cta_starts(
+        cta_starts,
+        token_start_values=token_start_values,
+        geometry=geometry,
+    )
+
+    assert validated.data_ptr() == cta_starts.data_ptr()
+    assert validated.shape == (4,)
+    with pytest.raises(ValueError, match=r"entry \[1, 0\] is 2, expected 1"):
+        context_module._validate_variable_window_cta_starts(
+            torch.tensor(((0, 256), (2, 0)), dtype=torch.int32),
+            token_start_values=token_start_values,
+            geometry=geometry,
+        )
+    with pytest.raises(ValueError, match=r"must have shape \(2, 2\)"):
+        context_module._validate_variable_window_cta_starts(
+            torch.zeros(4, dtype=torch.int32),
+            token_start_values=token_start_values,
+            geometry=geometry,
+        )
+    with pytest.raises(ValueError, match="must have dtype torch.int32"):
+        context_module._validate_variable_window_cta_starts(
+            torch.zeros((2, 2), dtype=torch.float32),
+            token_start_values=token_start_values,
+            geometry=geometry,
+        )
+    with pytest.raises(ValueError, match="must have compact"):
+        context_module._validate_variable_window_cta_starts(
+            torch.zeros((2, 4), dtype=torch.int32)[:, ::2],
+            token_start_values=token_start_values,
+            geometry=geometry,
+        )
+
+
+def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None:
+    empty_i32 = torch.empty(1, dtype=torch.int32)
+    wrapper = BatchPrefillTSWrapper()
+    wrapper._plan_state = context_module._ContextPlanState(
+        geometry=SimpleNamespace(packed=False, mask_type="dense"),
+        scale_softmax_log2=torch.empty(1),
+        output_scale=torch.empty(1),
+        empty_i32=empty_i32,
+        variable_window_padded_starts=None,
+        variable_window_cta_starts=empty_i32,
+        compiled=lambda *_args: None,
+        policy=(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="variable-window metadata requires mask_type='variable_window'",
+    ):
+        wrapper.run(
+            torch.empty(1),
+            torch.empty(1),
+            torch.empty(1),
+            variable_window_cta_starts=torch.empty(1, dtype=torch.int32),
+            validate=False,
+        )
+
+
+def test_attention_ts_context_alias_guard_covers_precomputed_cta_starts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        context_module, "_validate_runtime_inputs", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
+    monkeypatch.setattr(
+        context_module,
+        "_prepare_out",
+        lambda out, *, q, output_dtype: out,
+    )
+    empty_i32 = torch.empty(1, dtype=torch.int32)
+    wrapper = BatchPrefillTSWrapper()
+    wrapper._plan_state = context_module._ContextPlanState(
+        geometry=SimpleNamespace(
+            device=torch.device("cpu"),
+            batch_size=1,
+            max_seq_len_q=1,
+            max_seq_len_k=1,
+            head_dim=128,
+            output_dtype=torch.int32,
+            packed=False,
+            mask_type="variable_window",
+        ),
+        scale_softmax_log2=torch.empty(1),
+        output_scale=torch.empty(1),
+        empty_i32=empty_i32,
+        variable_window_padded_starts=None,
+        variable_window_cta_starts=torch.empty(1, dtype=torch.int32),
+        compiled=lambda *_args: None,
+        policy=(),
+    )
+    starts = torch.zeros((1, 1), dtype=torch.int32)
+    ends = torch.zeros_like(starts)
+    out = torch.zeros((1, 1), dtype=torch.int32)
+
+    with pytest.raises(
+        ValueError,
+        match="out must not overlap variable_window_cta_starts storage",
+    ):
+        wrapper.run(
+            torch.empty(1),
+            torch.empty(1),
+            torch.empty(1),
+            variable_window_token_starts=starts,
+            variable_window_token_ends=ends,
+            variable_window_cta_starts=out,
+            out=out,
+        )
+
+
 def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     monkeypatch,
 ) -> None:
@@ -1546,15 +1796,18 @@ def test_attention_ts_context_paged_explicit_uniform_plan_compiles_once(
         mask_type="causal",
         uniform_packed_lengths=True,
         has_q_offset=False,
+        paged_v_tail_is_zero=True,
     )
 
     assert len(compile_specs) == 1
     assert compile_specs[0].uniform_packed_lengths is True
     assert compile_specs[0].has_q_offset is False
+    assert compile_specs[0].paged_v_tail_is_zero is True
     state = wrapper._plan_state
     assert state is not None
     assert state.geometry.uniform_packed_lengths is True
     assert state.geometry.has_q_offset is False
+    assert state.geometry.paged_v_tail_is_zero is True
     assert dict(state.policy)["marker"] == "uniform"
     assert not hasattr(state, "uniform_compiled")
     assert not hasattr(state, "uniform_policy")
@@ -2353,6 +2606,43 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
     )
 
 
+@pytest.mark.parametrize("head_dim", (128, 256))
+@pytest.mark.parametrize("input_dtype", (Float8E4M3FN, BFloat16), ids=("fp8", "bf16"))
+def test_attention_ts_context_contiguous_schedule_builds(head_dim, input_dtype):
+    """Contiguous task graphs build without paged metadata dependencies or JIT."""
+    kernel = FmhaTs(
+        in_dtype=input_dtype,
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=head_dim,
+        is_persistent=True,
+        is_causal=False,
+        is_clc_dynamic=False,
+    )
+    cfg = kernel.cfg
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        task_manager, *_ = build_fmha_task_manager(
+            cfg,
+            tile_sched_params=None,
+            tma_q_desc=None,
+            tma_k_desc=None,
+            tma_v_desc=None,
+            tma_o_desc=None,
+            cum_seqlen_q=None,
+            cum_seqlen_k=None,
+            num_kv_tiles=2,
+            q_offset=0,
+            g_block_tables=None,
+            g_seq_lens_kv=None,
+            max_seq_len_kv=256,
+            is_persistent=True,
+            is_clc_dynamic=False,
+            exhaustive_deadlock_race_check=True,
+        )
+    assert task_manager is not None
+
+
 @pytest.mark.parametrize(
     (
         "is_persistent",
@@ -2960,15 +3250,26 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         **common,
         mask_type="dense",
     )
+    zero_tail_geometry = context_module._resolve_paged_plan_geometry(
+        **common,
+        mask_type="causal",
+        paged_v_tail_is_zero=True,
+    )
 
     assert causal_geometry.uniform_packed_lengths is False
     assert causal_geometry.has_q_offset is True
+    assert causal_geometry.paged_v_tail_is_zero is False
     assert causal_geometry.packed_dense_k_mask is False
     assert dense_geometry.uniform_packed_lengths is False
     assert dense_geometry.has_q_offset is False
+    assert dense_geometry.paged_v_tail_is_zero is False
     assert dense_geometry.packed_dense_k_mask is True
+    assert zero_tail_geometry.paged_v_tail_is_zero is True
     assert context_module._paged_context_compile_spec(causal_geometry) != (
         context_module._paged_context_compile_spec(dense_geometry)
+    )
+    assert context_module._paged_context_compile_spec(causal_geometry) != (
+        context_module._paged_context_compile_spec(zero_tail_geometry)
     )
 
 
@@ -2990,6 +3291,18 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
             },
             True,
             id="dynamic-paged",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": False,
+                "is_causal": True,
+                "paged_v_tail_is_zero": True,
+                "uniform_seq_len_q": 1024,
+                "uniform_seq_len_k": 1024,
+            },
+            False,
+            id="caller-zeroed-paged-v-tail",
         ),
         pytest.param(
             {
@@ -3077,7 +3390,7 @@ def test_attention_ts_context_paged_v_tail_clear_policy(
     config_overrides,
     expected,
 ):
-    """Only complete exact-uniform causal grids omit the V-tail clear."""
+    """Exact full grids and caller-zeroed tails omit the V-tail clear."""
 
     cfg = FmhaConfig(kv_tile_n=128, q_tile_m=128, **config_overrides)
 
@@ -3504,6 +3817,8 @@ def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: i
     starts = torch.full((1, seq_len_q), 128, dtype=torch.int32, device="cuda")
     starts[0, 160] = 0
     ends = torch.full((1, seq_len_q), seq_len_k - 1, dtype=torch.int32, device="cuda")
+    tile_size_q = 256 if head_dim == 128 else 128
+    cta_starts = starts.view(1, -1, tile_size_q).amin(dim=-1)
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
@@ -3512,6 +3827,7 @@ def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: i
         case,
         variable_window_token_starts=starts,
         variable_window_token_ends=ends,
+        variable_window_cta_starts=cta_starts,
     )
     expected = _variable_window_reference(case, starts, ends)
     _assert_context_correct(actual, case, expected=expected)
@@ -3542,6 +3858,7 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
     query_positions = torch.arange(seq_len, dtype=torch.int32, device="cuda")
     ends = query_positions.unsqueeze(0).expand(2, -1).contiguous()
     starts = torch.clamp(ends - 7, min=0)
+    cta_starts = starts.amin(dim=-1, keepdim=True)
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
@@ -3550,6 +3867,7 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
         case,
         variable_window_token_starts=starts,
         variable_window_token_ends=ends,
+        variable_window_cta_starts=cta_starts,
     )
     expected = _variable_window_reference(case, starts, ends)
     _assert_context_correct(actual, case, expected=expected)

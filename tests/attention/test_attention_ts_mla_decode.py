@@ -563,6 +563,22 @@ def _param(
 
 _MLA_CASES = (
     _param(
+        _case(2, 8, 64, torch.bfloat16, 32000),
+        {"kernel": "throughput_2cta"},
+        None,
+        False,
+        exercise_all_paths=True,
+        id="bf16-short-k-2cta-fallback",
+    ),
+    _param(
+        _case(2, 8, 64, torch.float8_e4m3fn, 31999),
+        {"kernel": "throughput_2cta"},
+        None,
+        False,
+        exercise_all_paths=True,
+        id="fp8-short-k-2cta-fallback",
+    ),
+    _param(
         _case(2, 8, 2048, torch.bfloat16, 32001),
         {
             "kernel": "throughput_latency_1cta",

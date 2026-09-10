@@ -37,19 +37,21 @@ Both reusable wrappers use a static-spec lifecycle. `plan()` receives only
 device, capacity, head, dtype, mask, window, and default-scale information. The
 contiguous plan also freezes its `packed` storage-mode choice (`False` for fixed
 BSHD, `True` for packed THD); the paged plan additionally receives page size
-and optional `uniform_packed_lengths` / `has_q_offset` metadata contracts.
+and optional `uniform_packed_lengths`, `has_q_offset`, and
+`paged_v_tail_is_zero` contracts.
 Neither plan retains Q/K/V tensors or request metadata. Every `run()` supplies
 the current tensors and metadata: packed
-contiguous offsets, per-token variable-window bounds for fixed-shape inputs, or
-paged Q offsets, fixed page-table rows, and K/V lengths. Both wrappers own
-one-element device tensors for their default softmax and output scales.
-Contiguous variable-window plans additionally own mutable scratch that reduces
-only the start bounds to per-CTA minima; end bounds remain per-token. Paged
-plans own no workspace beyond the default scale tensors. Runtime validation is
-enabled by default and may read metadata back to the host. `validate=False`
-skips those checks for a previously validated steady state or CUDA Graph
-launch; the caller then owns every dtype, device, shape, stride, alignment,
-value, aliasing, and lifetime obligation in the runtime contract.
+contiguous offsets, per-token variable-window bounds and optional precomputed
+CTA start minima for fixed-shape inputs, or paged Q offsets, fixed page-table
+rows, and K/V lengths. Both wrappers own one-element device tensors for their
+default softmax and output scales. Contiguous variable-window plans
+additionally own mutable fallback scratch that reduces start bounds to per-CTA
+minima only when the caller omits those minima; end bounds remain per-token.
+Paged plans own no workspace beyond the default scale tensors. Runtime
+validation is enabled by default and may read metadata back to the host.
+`validate=False` skips those checks for a previously validated steady state or
+CUDA Graph launch; the caller then owns every dtype, device, shape, stride,
+alignment, value, aliasing, and lifetime obligation in the runtime contract.
 
 ## Supported contract
 
@@ -83,11 +85,11 @@ reserves 255 values for the padded tail of the largest supported 256-row query
 work tile.
 
 Q, K, V, and `out` must be compact, 16-byte-aligned CUDA tensors on one
-device. Cumulative offsets, sequence lengths, and variable-window bounds must
+device. Cumulative offsets, sequence lengths, and variable-window metadata must
 be compact CUDA `torch.int32` tensors on that device and at least 4-byte
 aligned. `block_tables` instead permits the row-strided layout documented
 below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
-or plan-owned scale/scratch storage. The launch conservatively rejects
+or active plan-owned scale/scratch storage. The launch conservatively rejects
 overlapping storage spans. The API returns O only; rowwise LSE and other
 softmax state remain internal to the kernel.
 
@@ -101,6 +103,12 @@ Contiguous inputs:
 - Packed metadata: compact CUDA `int32[B + 1]` `qo_indptr` and `kv_indptr`.
   Both start at zero, increase strictly, and end at the corresponding packed
   tensor extent.
+- Fixed variable-window metadata: inclusive per-token starts and ends shaped
+  `[B, max_seq_len_q]`. `variable_window_cta_starts` may additionally provide
+  the exact minimum token start for every Q work tile, shaped
+  `[B, ceil(max_seq_len_q / Tq)]`, where `Tq=256` for head dimension 128 and
+  `Tq=128` for head dimension 256. The final entry in each row covers only the
+  remaining real Q rows, without conceptual padding.
 
 Paged inputs:
 
@@ -146,8 +154,10 @@ Every causal replay must additionally satisfy `Sq[b] <= Sk[b]`. The
 request-local bottom-right offset `Sk[b] - Sq[b]` may change and is derived
 from the live offsets. Fixed variable-window plans likewise receive current
 `[B, max_seq_len_q]` inclusive start/end bounds on every run. Only the start
-bounds are reduced to per-CTA minima; end bounds remain per-token inputs. The
-contiguous wrapper owns the mutable scratch used for that start reduction.
+bounds need per-CTA minima; end bounds remain per-token inputs. A caller may
+provide those minima once for all layers that share the same geometry and
+metadata. Otherwise, the contiguous wrapper derives them on every run using
+its mutable fallback scratch.
 
 Paged wrapper planning fixes static capacities and one compile-time metadata
 contract. The conservative defaults, `uniform_packed_lengths=False` and
@@ -160,22 +170,32 @@ extent. For causal attention, every per-run `Sq[b]` is no greater than `Sk[b]`.
 `uniform_packed_lengths=True` is a caller promise that every Q delta equals
 `max_seq_len_q` and every K/V length equals `max_kv_len`.
 `has_q_offset=False` is a separate causal promise that `Sq[b] == Sk[b]` for
-every request; dense attention ignores and canonicalizes this flag. These
-promises compile exactly one narrower specialization rather than a runtime
-choice between kernels. Re-plan before changing a promise. The one-shot paged
-API already reads the metadata and derives the tightest valid flags for its
-temporary plan.
+every request; dense attention ignores and canonicalizes this flag.
+`paged_v_tail_is_zero=True` promises that unused rows following each request's
+logical K/V length in its active final V page contain zero. This removes the
+consumer-side post-TMA V-tail clear. The default `False` preserves correctness
+for arbitrary contents, including NaNs, in those unused rows. These promises
+compile exactly one specialization rather than a runtime choice between
+kernels. Re-plan before changing a promise. The one-shot paged API derives the
+tightest valid length flags for its temporary plan and conservatively keeps the
+V-tail clear.
 
 With the default `validate=True`, `run()` checks tensor structure, shapes,
 dtypes, devices, scales, output, aliasing, page-table strides, sequence
 lengths, and active page IDs. Those metadata checks read device values back to
-the host and may synchronize. `validate=False` skips validation and host
-readback; callers using that path must enforce every dtype, device, shape,
-stride, alignment, value, aliasing, lifetime, and selected plan-promise
-obligation because invalid offsets, lengths, page IDs, or false compile-time
-promises can produce incorrect results or out-of-bounds access.
+the host and may synchronize. Caller-provided variable-window CTA starts are
+also checked against the exact minimum of the corresponding per-token starts.
+Validation does not inspect V-cache contents, so the caller owns
+`paged_v_tail_is_zero=True` even with `validate=True`.
+`validate=False` skips validation and host readback; callers using that path
+must enforce every dtype, device, shape, stride, alignment, value, aliasing,
+lifetime, and selected plan-promise obligation because invalid offsets,
+lengths, page IDs, or false compile-time promises can produce incorrect results
+or out-of-bounds access.
 CUDA Graph capture requires `validate=False` plus stable tensor shapes,
 strides, and addresses, although values may change between completed replays.
+When caller-provided CTA starts are used, their values must be updated
+consistently with the per-token starts before each replay.
 
 ## Dataflow and source map
 
@@ -291,11 +311,12 @@ assert out.shape == q.shape
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
 run-time tensor shape, stride, and address stable, preserve any explicit
-`uniform_packed_lengths` / `has_q_offset` promises, and pass a preallocated,
-non-overlapping `out`. Callers must keep storage unmodified until queued work
-completes. Before running on a CUDA stream that is not already ordered after the
-planning stream, the caller must establish that dependency. Keep the wrapper and
-all captured runtime tensors alive until every graph using that plan is destroyed.
+length or zero-tail promises, keep variable-window token and CTA starts
+consistent when supplying both, and pass a preallocated, non-overlapping `out`.
+Callers must keep storage unmodified until queued work completes. Before
+running on a CUDA stream that is not already ordered after the planning stream,
+the caller must establish that dependency. Keep the wrapper and all captured
+runtime tensors alive until every graph using that plan is destroyed.
 
 ## Limitations
 
@@ -311,10 +332,13 @@ all captured runtime tensors alive until every graph using that plan is destroye
   promises are also static for paged plans. Request tensors and metadata may
   change between completed runs while remaining within the static plan and its
   promises.
-- A variable-window wrapper owns mutable CTA-minimum scratch, so its launches
-  must not overlap across streams or captured graphs. Replanning either wrapper
-  replaces plan-owned tensors and invalidates graphs captured from the prior
-  plan; finish all prior launches and replays before replanning.
+- Variable-window launches that omit `variable_window_cta_starts` mutate the
+  wrapper's fallback CTA-minimum scratch and must not overlap across streams or
+  captured graphs. Supplying caller-owned CTA starts avoids that mutable plan
+  state and permits overlap when the remaining tensor-lifetime requirements
+  are satisfied. Replanning either wrapper replaces plan-owned tensors and
+  invalidates graphs captured from the prior plan; finish all prior launches
+  and replays before replanning.
 
 ## Validation
 

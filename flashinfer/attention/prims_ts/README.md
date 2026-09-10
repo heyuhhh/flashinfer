@@ -23,19 +23,25 @@ The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
 
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
-reusable static state from per-run request state. `plan()` compiles a static
-capacity, shape, dtype, and storage-mode specialization without retaining
-request tensors or metadata. Paged context plans may additionally freeze
-explicit exact-uniform-length or zero-causal-offset promises. Context `run()`
-receives current packed offsets or fixed-table paged metadata; per-token
-variable-window bounds for fixed-shape inputs are also per-run. Both context
-wrappers own their default scale tensors;
-contiguous variable-window plans additionally own mutable scratch that reduces
-only start bounds to per-CTA minima, while paged context owns no other
-workspace. Runtime validation is enabled by default; callers that have already
-validated their inputs may use `validate=False` for steady-state timing or CUDA
-Graph capture and then own every dtype, device, shape, stride, alignment,
-value, aliasing, and lifetime obligation.
+reusable static state from per-run request state. By default, `plan()` compiles
+a static capacity, shape, dtype, and storage-mode specialization without
+retaining request tensors or metadata. FMHA decode plans may instead own fixed
+K/V lengths when `plan(seq_lens=...)` is supplied; those runs must pass
+`seq_lens=None`, and changing lengths requires replanning. Paged context plans
+may additionally freeze
+explicit exact-uniform-length, zero-causal-offset, or zeroed-V-tail promises.
+Context `run()` receives current packed offsets or fixed-table paged metadata;
+per-token variable-window bounds for fixed-shape inputs are also per-run, with
+optional caller-precomputed per-CTA start minima. Both context wrappers own
+their default scale tensors. Contiguous variable-window plans additionally own
+mutable fallback scratch that derives CTA minima only when the caller omits
+them, while paged context owns no other workspace. With `validate=False`,
+supplying CTA minima avoids that repeated preprocessing and leaves all
+variable-window metadata caller-owned. Runtime validation is enabled by
+default; callers that have already validated their inputs may use
+`validate=False` for steady-state timing or CUDA Graph capture and then own
+every dtype, device, shape, stride, alignment, value, aliasing, and lifetime
+obligation.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no

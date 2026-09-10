@@ -195,7 +195,7 @@ def test_uses_explicit_seq_lens_instead_of_page_derived_lengths():
     torch.testing.assert_close(
         delegate.plan.call_args.kwargs["seq_lens"], seq_lens.cpu().to(torch.int64)
     )
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], seq_lens)
+    assert wrapper._kv_lens_buffer is None
     assert wrapper._block_tables.tolist() == [[0, 1, -1], [2, 3, 4]]
 
 
@@ -231,13 +231,14 @@ def test_plan_converts_padded_csr_rows_from_their_actual_offsets():
 
 
 @requires_cuda
-def test_plan_retains_explicit_row_strided_block_table():
-    """An explicit native table remains the stable plan-owned run binding."""
+@pytest.mark.parametrize("table_dtype", (torch.int32, torch.uint32))
+def test_plan_retains_explicit_row_strided_block_table(table_dtype):
+    """Signed and unsigned page tables share storage with the native binding."""
 
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
     wrapper._prims_ts_wrapper = delegate
-    backing = torch.full((2, 8), -101, dtype=torch.int32, device="cuda")
+    backing = torch.full((2, 8), -101, dtype=torch.int32, device="cuda").to(table_dtype)
     block_tables = backing[:, :4]
     block_tables[0, :2] = torch.tensor((0, 1), dtype=torch.int32, device="cuda")
     block_tables[1, :3] = torch.tensor((2, 3, 4), dtype=torch.int32, device="cuda")
@@ -248,8 +249,15 @@ def test_plan_retains_explicit_row_strided_block_table():
         block_tables=block_tables,
     )
 
-    assert wrapper._block_tables is block_tables
+    if table_dtype == torch.int32:
+        assert wrapper._block_tables is block_tables
+    assert wrapper._block_tables.dtype == torch.int32
+    assert wrapper._block_tables.data_ptr() == block_tables.data_ptr()
     assert wrapper._block_tables.stride() == (8, 1)
+    torch.testing.assert_close(wrapper._block_tables, block_tables.to(torch.int32))
+
+    block_tables[0, 0] = 4
+    assert wrapper._block_tables[0, 0].item() == 4
 
 
 @requires_cuda
@@ -268,12 +276,12 @@ def test_run_forwards_fixed_table_to_native_delegate():
 
     native_args = delegate.run.call_args.args
     assert len(native_args) == 4
-    assert native_args[2].data_ptr() == wrapper._kv_lens_buffer.data_ptr()
+    assert native_args[2] is None
     assert native_args[3] is wrapper._block_tables
 
 
 @requires_cuda
-def test_normalizes_uint32_seq_lens_for_plan_evidence():
+def test_normalizes_uint32_seq_lens_for_plan_owned_lengths():
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
     wrapper._prims_ts_wrapper = delegate
@@ -289,10 +297,7 @@ def test_normalizes_uint32_seq_lens_for_plan_evidence():
     assert plan_seq_lens.device.type == "cpu"
     assert plan_seq_lens.dtype == torch.int64
     torch.testing.assert_close(plan_seq_lens, seq_lens.cpu().to(torch.int64))
-    assert wrapper._kv_lens_buffer.dtype == torch.int32
-    torch.testing.assert_close(
-        wrapper._kv_lens_buffer[:2], seq_lens.to(dtype=torch.int32)
-    )
+    assert wrapper._kv_lens_buffer is None
 
 
 @requires_cuda
@@ -302,8 +307,6 @@ def test_rejects_uint32_seq_lens_outside_decode_coordinate_range():
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
     wrapper._prims_ts_wrapper = delegate
-    wrapper._kv_lens_buffer[:2].fill_(7)
-    original_live_lengths = wrapper._kv_lens_buffer[:2].clone()
     seq_lens = torch.tensor(
         [32, _DECODE_MAX_KV_LEN + 1], dtype=torch.uint32, device="cuda"
     )
@@ -316,26 +319,47 @@ def test_rejects_uint32_seq_lens_outside_decode_coordinate_range():
         )
 
     delegate.plan.assert_not_called()
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], original_live_lengths)
+    assert wrapper._kv_lens_buffer is None
 
 
 @requires_cuda
-def test_failed_low_level_replan_preserves_live_seq_lens():
+def test_successful_replan_recovers_from_low_level_plan_failure():
+    """After a failed plan, a successful plan rebinds all runtime metadata."""
+
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
-    delegate.plan.side_effect = RuntimeError("compile failed")
     wrapper._prims_ts_wrapper = delegate
-    wrapper._kv_lens_buffer[:2].fill_(7)
-    original_live_lengths = wrapper._kv_lens_buffer[:2].clone()
+    wrapper.plan(
+        *_plan_args([32, 48], "cuda"),
+        q_data_type=torch.bfloat16,
+    )
+    delegate.plan.side_effect = RuntimeError("compile failed")
 
     with pytest.raises(RuntimeError, match="compile failed"):
         wrapper.plan(
-            *_plan_args([32, 48], "cuda"),
+            *_plan_args([16, 16], "cuda"),
             q_data_type=torch.bfloat16,
-            seq_lens=torch.tensor([32, 40], dtype=torch.uint32, device="cuda"),
         )
 
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], original_live_lengths)
+    delegate.plan.side_effect = None
+    wrapper.plan(
+        *_plan_args([16, 32, 48], "cuda"),
+        q_data_type=torch.bfloat16,
+        q_len_per_req=4,
+    )
+
+    assert wrapper._block_tables.tolist() == [[0, -1, -1], [1, 2, -1], [3, 4, 5]]
+    assert wrapper._qo_indptr_buf.tolist() == [0, 4, 8, 12]
+    assert delegate.plan.call_args.kwargs["seq_lens"].tolist() == [16, 32, 48]
+    assert wrapper._kv_lens_buffer is None
+
+    delegate.run.side_effect = lambda *_args, **kwargs: kwargs["out"]
+    q = torch.empty((12, NUM_QO_HEADS, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    k_cache, v_cache = _make_cache([16, 32, 48], torch.bfloat16, "cuda")
+    out = wrapper.run(q, (k_cache, v_cache))
+    assert out.shape == q.shape
+    assert delegate.run.call_args.args[3] is wrapper._block_tables
+    assert delegate.run.call_args.kwargs["qo_indptr"] is wrapper._qo_indptr_buf
 
 
 def test_plan_trace_captures_explicit_causal_mode():
